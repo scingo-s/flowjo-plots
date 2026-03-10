@@ -178,16 +178,6 @@ def _find_plot_sheet(zf: zipfile.ZipFile) -> tuple[str, str]:
     raise ValueError("Plot sheet not found")
 
 
-def _get_max_rid(rels_root: etree._Element) -> int:
-    """rels ファイル内の最大 rId 番号を返す."""
-    max_id = 0
-    for rel in rels_root:
-        rid = rel.get("Id", "")
-        m = re.search(r"(\d+)", rid)
-        if m:
-            max_id = max(max_id, int(m.group(1)))
-    return max_id
-
 
 def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
                           num_rows: int = 0, num_cols: int = NUM_COLS) -> bytes:
@@ -209,79 +199,69 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
                 break
             cells.append((col_letter, excel_row, idx))
 
-    # --- Rich Data XML を生成 ---
+    # --- Rich Data XML を文字列テンプレートで生成 (lxml 非依存) ---
+    _XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
 
     # 1. richValueRel.xml
-    rv_rel = etree.Element(f"{{{NS_RICHVALREL}}}richValueRels",
-                           nsmap={None: NS_RICHVALREL, "r": NS_REL})
+    rv_rel_xml = _XML_DECL
+    rv_rel_xml += '<richValueRels xmlns="http://schemas.microsoft.com/office/spreadsheetml/2022/richvaluerel" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
     for i in range(n):
-        el = etree.SubElement(rv_rel, f"{{{NS_RICHVALREL}}}rel")
-        el.set(f"{{{NS_REL}}}id", f"rId{i + 1}")
+        rv_rel_xml += f'<rel r:id="rId{i + 1}"/>'
+    rv_rel_xml += '</richValueRels>'
 
     # 2. richValueRel.xml.rels
-    rv_rels = etree.Element("Relationships", xmlns=NS_PKG_REL)
+    rv_rels_xml = _XML_DECL
+    rv_rels_xml += '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
     for i in range(n):
-        etree.SubElement(rv_rels, "Relationship",
-                         Id=f"rId{i + 1}",
-                         Type=REL_TYPE_IMAGE,
-                         Target=f"../media/image{i + 1}.png")
+        rv_rels_xml += (f'<Relationship Id="rId{i + 1}" '
+                        f'Type="{REL_TYPE_IMAGE}" '
+                        f'Target="../media/image{i + 1}.png"/>')
+    rv_rels_xml += '</Relationships>'
 
     # 3. rdrichvalue.xml
-    rv_data = etree.Element(f"{{{NS_RICHDATA}}}rvData", count=str(n),
-                            nsmap={None: NS_RICHDATA})
+    rv_data_xml = _XML_DECL
+    rv_data_xml += f'<rvData xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="{n}">'
     for i in range(n):
-        rv = etree.SubElement(rv_data, f"{{{NS_RICHDATA}}}rv", s="0")
-        v1 = etree.SubElement(rv, f"{{{NS_RICHDATA}}}v")
-        v1.text = str(i)
-        v2 = etree.SubElement(rv, f"{{{NS_RICHDATA}}}v")
-        v2.text = "5"
+        rv_data_xml += f'<rv s="0"><v>{i}</v><v>5</v></rv>'
+    rv_data_xml += '</rvData>'
 
     # 4. rdrichvaluestructure.xml
-    rv_struct = etree.Element(f"{{{NS_RICHDATA}}}rvStructures", count="1",
-                              nsmap={None: NS_RICHDATA})
-    s_el = etree.SubElement(rv_struct, f"{{{NS_RICHDATA}}}s", t="_localImage")
-    etree.SubElement(s_el, f"{{{NS_RICHDATA}}}k", n="_rvRel:LocalImageIdentifier", t="i")
-    etree.SubElement(s_el, f"{{{NS_RICHDATA}}}k", n="CalcOrigin", t="i")
+    rv_struct_xml = _XML_DECL
+    rv_struct_xml += '<rvStructures xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="1">'
+    rv_struct_xml += '<s t="_localImage"><k n="_rvRel:LocalImageIdentifier" t="i"/><k n="CalcOrigin" t="i"/></s>'
+    rv_struct_xml += '</rvStructures>'
 
     # 5. rdRichValueTypes.xml
-    rv_types = etree.Element(f"{{{NS_RICHDATA2}}}rvTypesInfo",
-                             nsmap={None: NS_RICHDATA2, "mc": NS_MC, "x": NS_SHEET})
-    rv_types.set(f"{{{NS_MC}}}Ignorable", "x")
-    g = etree.SubElement(rv_types, f"{{{NS_RICHDATA2}}}global")
-    kf = etree.SubElement(g, f"{{{NS_RICHDATA2}}}keyFlags")
+    rv_types_xml = _XML_DECL
+    rv_types_xml += ('<rvTypesInfo xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata2"'
+                     ' xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"'
+                     ' mc:Ignorable="x"'
+                     ' xmlns:x="http://schemas.openxmlformats.org/spreadsheetml/2006/main">')
+    rv_types_xml += '<global><keyFlags>'
     for kname in ["_Self", "_DisplayString", "_Flags", "_Format",
                    "_SubLabel", "_Attribution", "_Icon", "_Display",
                    "_CanonicalPropertyNames", "_ClassificationId"]:
-        k = etree.SubElement(kf, f"{{{NS_RICHDATA2}}}key", name=kname)
         if kname == "_Self":
-            etree.SubElement(k, f"{{{NS_RICHDATA2}}}flag",
-                             name="ExcludeFromFile", value="1")
-        etree.SubElement(k, f"{{{NS_RICHDATA2}}}flag",
-                         name="ExcludeFromCalcComparison", value="1")
+            rv_types_xml += f'<key name="{kname}"><flag name="ExcludeFromFile" value="1"/><flag name="ExcludeFromCalcComparison" value="1"/></key>'
+        else:
+            rv_types_xml += f'<key name="{kname}"><flag name="ExcludeFromCalcComparison" value="1"/></key>'
+    rv_types_xml += '</keyFlags></global></rvTypesInfo>'
 
     # 6. metadata.xml
-    meta = etree.Element(f"{{{NS_SHEET}}}metadata",
-                         nsmap={None: NS_SHEET, "xlrd": NS_RICHDATA})
-
-    mt = etree.SubElement(meta, f"{{{NS_SHEET}}}metadataTypes", count="1")
-    etree.SubElement(mt, f"{{{NS_SHEET}}}metadataType",
-                     name="XLRICHVALUE", minSupportedVersion="120000",
-                     copy="1", pasteAll="1", pasteValues="1", merge="1",
-                     splitFirst="1", rowColShift="1", clearFormats="1",
-                     clearComments="1", assign="1", coerce="1")
-
-    fm = etree.SubElement(meta, f"{{{NS_SHEET}}}futureMetadata",
-                          name="XLRICHVALUE", count=str(n))
+    meta_xml = _XML_DECL
+    meta_xml += '<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata">'
+    meta_xml += '<metadataTypes count="1">'
+    meta_xml += '<metadataType name="XLRICHVALUE" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1"/>'
+    meta_xml += '</metadataTypes>'
+    meta_xml += f'<futureMetadata name="XLRICHVALUE" count="{n}">'
     for i in range(n):
-        bk = etree.SubElement(fm, f"{{{NS_SHEET}}}bk")
-        ext_lst = etree.SubElement(bk, f"{{{NS_SHEET}}}extLst")
-        ext = etree.SubElement(ext_lst, f"{{{NS_SHEET}}}ext", uri=GUID_RICHVALUE)
-        etree.SubElement(ext, f"{{{NS_RICHDATA}}}rvb", i=str(i))
-
-    vm = etree.SubElement(meta, f"{{{NS_SHEET}}}valueMetadata", count=str(n))
+        meta_xml += f'<bk><extLst><ext uri="{GUID_RICHVALUE}"><xlrd:rvb i="{i}"/></ext></extLst></bk>'
+    meta_xml += '</futureMetadata>'
+    meta_xml += f'<valueMetadata count="{n}">'
     for i in range(n):
-        bk = etree.SubElement(vm, f"{{{NS_SHEET}}}bk")
-        etree.SubElement(bk, f"{{{NS_SHEET}}}rc", t="1", v=str(i))
+        meta_xml += f'<bk><rc t="1" v="{i}"/></bk>'
+    meta_xml += '</valueMetadata>'
+    meta_xml += '</metadata>'
 
     # --- xlsx ZIP を書き換え ---
     output = io.BytesIO()
@@ -337,36 +317,23 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
         zout.writestr(sheet_path, sheet_xml.encode("utf-8"))
 
         # Rich Data ファイルを書き出し
-        def _to_xml(root_el):
-            return etree.tostring(root_el, xml_declaration=True,
-                                  encoding="UTF-8", standalone=True)
-
-        zout.writestr("xl/richData/richValueRel.xml", _to_xml(rv_rel))
-        zout.writestr("xl/richData/_rels/richValueRel.xml.rels", _to_xml(rv_rels))
-        zout.writestr("xl/richData/rdrichvalue.xml", _to_xml(rv_data))
-        zout.writestr("xl/richData/rdrichvaluestructure.xml", _to_xml(rv_struct))
-        zout.writestr("xl/richData/rdRichValueTypes.xml", _to_xml(rv_types))
-        zout.writestr("xl/metadata.xml", _to_xml(meta))
+        zout.writestr("xl/richData/richValueRel.xml", rv_rel_xml.encode("utf-8"))
+        zout.writestr("xl/richData/_rels/richValueRel.xml.rels", rv_rels_xml.encode("utf-8"))
+        zout.writestr("xl/richData/rdrichvalue.xml", rv_data_xml.encode("utf-8"))
+        zout.writestr("xl/richData/rdrichvaluestructure.xml", rv_struct_xml.encode("utf-8"))
+        zout.writestr("xl/richData/rdRichValueTypes.xml", rv_types_xml.encode("utf-8"))
+        zout.writestr("xl/metadata.xml", meta_xml.encode("utf-8"))
 
         # 画像ファイルを追加
         for i, img_data in enumerate(plot_images):
             zout.writestr(f"xl/media/image{i + 1}.png", img_data)
 
-        # [Content_Types].xml を更新
-        ct_root = etree.fromstring(zin.read("[Content_Types].xml"))
-        ct_ns = NS_CONTENT
-
-        # png Default がなければ追加
-        has_png = any(
-            el.get("Extension") == "png"
-            for el in ct_root.findall(f"{{{ct_ns}}}Default")
-        )
-        if not has_png:
-            etree.SubElement(ct_root, f"{{{ct_ns}}}Default",
-                             Extension="png", ContentType="image/png")
-
-        # Override エントリ追加
-        overrides = {
+        # [Content_Types].xml を更新 (文字列操作)
+        ct_xml = zin.read("[Content_Types].xml").decode("utf-8")
+        if 'Extension="png"' not in ct_xml:
+            ct_xml = ct_xml.replace("</Types>",
+                '<Default Extension="png" ContentType="image/png"/></Types>')
+        ct_overrides = {
             "/xl/metadata.xml":
                 "application/vnd.openxmlformats-officedocument.spreadsheetml.sheetMetadata+xml",
             "/xl/richData/richValueRel.xml":
@@ -378,21 +345,16 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
             "/xl/richData/rdRichValueTypes.xml":
                 "application/vnd.ms-excel.rdrichvaluetypes+xml",
         }
-        existing_parts = {
-            el.get("PartName")
-            for el in ct_root.findall(f"{{{ct_ns}}}Override")
-        }
-        for part, ctype in overrides.items():
-            if part not in existing_parts:
-                etree.SubElement(ct_root, f"{{{ct_ns}}}Override",
-                                 PartName=part, ContentType=ctype)
+        for part, ctype in ct_overrides.items():
+            if part not in ct_xml:
+                ct_xml = ct_xml.replace("</Types>",
+                    f'<Override PartName="{part}" ContentType="{ctype}"/></Types>')
+        zout.writestr("[Content_Types].xml", ct_xml.encode("utf-8"))
 
-        zout.writestr("[Content_Types].xml", _to_xml(ct_root))
-
-        # workbook.xml.rels を更新
-        wb_rels = etree.fromstring(zin.read("xl/_rels/workbook.xml.rels"))
-        max_rid = _get_max_rid(wb_rels)
-        existing_targets = {rel.get("Target") for rel in wb_rels}
+        # workbook.xml.rels を更新 (文字列操作)
+        wb_rels_xml = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+        rids = [int(m) for m in re.findall(r'Id="rId(\d+)"', wb_rels_xml)]
+        max_rid = max(rids) if rids else 0
 
         rel_entries = [
             ("metadata.xml", REL_TYPE_METADATA),
@@ -402,14 +364,11 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
             ("richData/rdRichValueTypes.xml", REL_TYPE_RICHVALTYPES),
         ]
         for target, rel_type in rel_entries:
-            if target not in existing_targets:
+            if f'Target="{target}"' not in wb_rels_xml:
                 max_rid += 1
-                etree.SubElement(wb_rels, "Relationship",
-                                 Id=f"rId{max_rid}",
-                                 Type=rel_type,
-                                 Target=target)
-
-        zout.writestr("xl/_rels/workbook.xml.rels", _to_xml(wb_rels))
+                wb_rels_xml = wb_rels_xml.replace("</Relationships>",
+                    f'<Relationship Id="rId{max_rid}" Type="{rel_type}" Target="{target}"/></Relationships>')
+        zout.writestr("xl/_rels/workbook.xml.rels", wb_rels_xml.encode("utf-8"))
 
     return output.getvalue()
 
