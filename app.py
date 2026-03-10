@@ -34,8 +34,9 @@ def check_password():
 
 def _reset_state():
     """処理ステートをリセットする."""
-    for key in ("step", "plots", "preview_grid", "xlsx_bytes", "result",
-                "img_validation", "pdf_warnings", "xlsx_warnings"):
+    for key in ("step", "plots", "num_rows", "num_cols", "preview_grid",
+                "xlsx_bytes", "result", "img_validation",
+                "pdf_warnings", "xlsx_warnings"):
         st.session_state.pop(key, None)
 
 
@@ -46,7 +47,7 @@ def show_upload_step():
         pdf_file = st.file_uploader(
             "FlowJo バッチ出力 PDF",
             type=["pdf"],
-            help="14サンプル x 8プロットのグリッド PDF",
+            help="サンプル x プロットのグリッド PDF（サンプル数は自動検出）",
         )
     with col2:
         xlsx_file = st.file_uploader(
@@ -70,13 +71,15 @@ def show_upload_step():
 
             # 画像抽出
             with st.spinner("PDF から画像を抽出中..."):
-                plots = extract_plots_from_pdf(pdf_bytes)
+                plots, num_rows, num_cols = extract_plots_from_pdf(pdf_bytes)
                 img_validation = validate_extracted_images(plots)
-                preview_grid = create_preview_grid(plots)
+                preview_grid = create_preview_grid(plots, cols=num_cols, rows=num_rows)
 
             # ステートに保存して次のステップへ
             st.session_state.step = "preview"
             st.session_state.plots = plots
+            st.session_state.num_rows = num_rows
+            st.session_state.num_cols = num_cols
             st.session_state.preview_grid = preview_grid
             st.session_state.xlsx_bytes = xlsx_bytes
             st.session_state.img_validation = img_validation
@@ -109,7 +112,9 @@ def show_preview_step():
         st.success(f"{total} 枚の画像を正常に抽出しました")
 
     # プレビュー表示
-    st.subheader("抽出画像プレビュー（14行 x 8列）")
+    nr = st.session_state.get("num_rows", "?")
+    nc = st.session_state.get("num_cols", "?")
+    st.subheader(f"抽出画像プレビュー（{nr}行 x {nc}列）")
     st.image(st.session_state.preview_grid, use_container_width=True)
 
     # アクションボタン
@@ -121,6 +126,8 @@ def show_preview_step():
                     result = insert_images_to_xlsx(
                         st.session_state.xlsx_bytes,
                         st.session_state.plots,
+                        st.session_state.num_rows,
+                        st.session_state.num_cols,
                     )
                 st.session_state.step = "done"
                 st.session_state.result = result

@@ -7,19 +7,13 @@ import re
 import zipfile
 
 import fitz
+import numpy as np
 from lxml import etree
 from PIL import Image
 
 
 DPI = 500
-NUM_ROWS = 14
-NUM_COLS = 8
-
-# 自動検出済みのプロット境界 (500 DPI ピクセル座標)
-COL_STARTS = [962, 1270, 1582, 1891, 2199, 2508, 2815, 3123]
-COL_ENDS = [1233, 1541, 1849, 2157, 2465, 2775, 3081, 3389]
-ROW_STARTS = [520, 841, 1163, 1484, 1805, 2126, 2447, 2768, 3089, 3410, 3732, 4053, 4374, 4695]
-ROW_ENDS = [783, 1104, 1426, 1747, 2068, 2389, 2710, 3031, 3352, 3674, 3995, 4316, 4637, 4958]
+NUM_COLS = 8  # プロット列数（固定: FSC/SSC, Pop1/2, CAR, CD3/56, etc.）
 
 # Excel Plot シートのセル配置
 EXCEL_COLS = ["E", "F", "H", "J", "L", "M", "N", "O"]
@@ -56,8 +50,66 @@ def _col_to_num(col_letter: str) -> int:
     return _COL_MAP[col_letter]
 
 
-def extract_plots_from_pdf(pdf_bytes: bytes) -> list[bytes]:
-    """PDF から 112枚のプロット画像を均一サイズで切り出す."""
+def _detect_grid(img: Image.Image) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """画像からプロットグリッドの行・列バンドを自動検出する.
+
+    Returns:
+        (row_bands, col_bands) - 各バンドは (start, end) のピクセル座標タプル.
+        col_bands はラベル列を除いたプロット列のみ.
+    """
+    arr = np.array(img.convert("L"))
+    h, w = arr.shape
+    content = arr < 240  # non-white pixels
+
+    # 行バンド検出: 各行の非白ピクセル数
+    row_proj = content.sum(axis=1)
+    row_threshold = w * 0.02
+    content_rows = np.where(row_proj > row_threshold)[0]
+
+    row_bands = []
+    if len(content_rows) > 0:
+        start = int(content_rows[0])
+        prev = start
+        for r in content_rows[1:]:
+            if r - prev > 15:
+                row_bands.append((start, int(prev)))
+                start = int(r)
+            prev = int(r)
+        row_bands.append((start, int(prev)))
+
+    # 列バンド検出: 各列の非白ピクセル数
+    col_proj = content.sum(axis=0)
+    col_threshold = h * 0.02
+    content_cols = np.where(col_proj > col_threshold)[0]
+
+    col_bands_all = []
+    if len(content_cols) > 0:
+        start = int(content_cols[0])
+        prev = start
+        for c in content_cols[1:]:
+            if c - prev > 15:
+                col_bands_all.append((start, int(prev)))
+                start = int(c)
+            prev = int(c)
+        col_bands_all.append((start, int(prev)))
+
+    # 狭いバンド（軸ラベル等）を除外: 最大幅の50%未満のバンドを除去
+    col_bands = col_bands_all
+    if len(col_bands_all) > 2:
+        widths = [e - s for s, e in col_bands_all]
+        max_width = max(widths)
+        col_bands = [(s, e) for s, e in col_bands_all
+                     if (e - s) >= max_width * 0.5]
+
+    return row_bands, col_bands
+
+
+def extract_plots_from_pdf(pdf_bytes: bytes) -> tuple[list[bytes], int, int]:
+    """PDF からプロット画像を自動検出・切り出す.
+
+    Returns:
+        (plots, num_rows, num_cols) - 画像バイトのリスト、検出された行数・列数.
+    """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
 
@@ -66,20 +118,20 @@ def extract_plots_from_pdf(pdf_bytes: bytes) -> list[bytes]:
     pix = page.get_pixmap(matrix=mat)
     img = Image.open(io.BytesIO(pix.tobytes("png")))
 
-    plots = []
-    for row in range(NUM_ROWS):
-        for col in range(NUM_COLS):
-            crop = img.crop((
-                COL_STARTS[col], ROW_STARTS[row],
-                COL_ENDS[col], ROW_ENDS[row],
-            ))
+    row_bands, col_bands = _detect_grid(img)
+    num_rows = len(row_bands)
+    num_cols = len(col_bands)
 
+    plots = []
+    for row_s, row_e in row_bands:
+        for col_s, col_e in col_bands:
+            crop = img.crop((col_s, row_s, col_e, row_e))
             buf = io.BytesIO()
             crop.save(buf, format="PNG")
             plots.append(buf.getvalue())
 
     doc.close()
-    return plots
+    return plots, num_rows, num_cols
 
 
 def _find_plot_sheet(zf: zipfile.ZipFile) -> tuple[str, str]:
@@ -124,19 +176,25 @@ def _get_max_rid(rels_root: etree._Element) -> int:
     return max_id
 
 
-def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes]) -> bytes:
+def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
+                          num_rows: int = 0, num_cols: int = NUM_COLS) -> bytes:
     """Excel の Plot シートに IMAGE 関数 (Rich Data) として画像を挿入する."""
     n = len(plot_images)
+    if num_rows == 0:
+        num_rows = n // num_cols
 
     # 画像セルの位置を生成
     cells = []
-    for row_i in range(NUM_ROWS):
+    for row_i in range(num_rows):
         excel_row = EXCEL_ROW_START + row_i * EXCEL_ROW_STEP
-        for col_i in range(NUM_COLS):
-            idx = row_i * NUM_COLS + col_i
+        for col_i in range(num_cols):
+            idx = row_i * num_cols + col_i
             if idx >= n:
                 break
-            cells.append((EXCEL_COLS[col_i], excel_row, idx))
+            col_letter = EXCEL_COLS[col_i] if col_i < len(EXCEL_COLS) else None
+            if col_letter is None:
+                break
+            cells.append((col_letter, excel_row, idx))
 
     # --- Rich Data XML を生成 ---
 
@@ -368,9 +426,6 @@ def validate_pdf(pdf_bytes: bytes) -> list[str]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     if doc.page_count != 1:
         warnings.append(f"PDF が {doc.page_count} ページあります（期待値: 1ページ）。先頭ページのみ処理します。")
-    page = doc[0]
-    if page.rect.width < page.rect.height:
-        warnings.append("PDF が縦長です。FlowJo バッチ出力は通常横長です。正しいファイルか確認してください。")
     doc.close()
     return warnings
 
@@ -390,9 +445,11 @@ def validate_extracted_images(plots: list[bytes]) -> dict:
 
 
 def create_preview_grid(plots: list[bytes], cols: int = NUM_COLS,
-                        rows: int = NUM_ROWS,
+                        rows: int = 0,
                         thumb_size: tuple[int, int] = (120, 100)) -> bytes:
     """プロット画像のグリッドプレビュー (PNG) を生成する."""
+    if rows == 0:
+        rows = (len(plots) + cols - 1) // cols
     tw, th = thumb_size
     pad = 4
     grid_w = cols * (tw + pad) + pad
@@ -427,5 +484,5 @@ def validate_excel(xlsx_bytes: bytes) -> list[str]:
 
 def process(pdf_bytes: bytes, xlsx_bytes: bytes) -> bytes:
     """PDF からプロットを切り出し、Excel に画像を挿入する."""
-    plots = extract_plots_from_pdf(pdf_bytes)
-    return insert_images_to_xlsx(xlsx_bytes, plots)
+    plots, num_rows, num_cols = extract_plots_from_pdf(pdf_bytes)
+    return insert_images_to_xlsx(xlsx_bytes, plots, num_rows, num_cols)
