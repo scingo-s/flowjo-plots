@@ -360,6 +360,69 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes]) -> bytes:
     return output.getvalue()
 
 
+def validate_pdf(pdf_bytes: bytes) -> list[str]:
+    """PDF の基本的な検証を行い、警告リストを返す."""
+    warnings = []
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    if doc.page_count != 1:
+        warnings.append(f"PDF が {doc.page_count} ページあります（期待値: 1ページ）。先頭ページのみ処理します。")
+    page = doc[0]
+    if page.rect.width < page.rect.height:
+        warnings.append("PDF が縦長です。FlowJo バッチ出力は通常横長です。正しいファイルか確認してください。")
+    doc.close()
+    return warnings
+
+
+def validate_extracted_images(plots: list[bytes]) -> dict:
+    """抽出した画像の品質を簡易チェックする."""
+    blank_count = 0
+    for img_bytes in plots:
+        img = Image.open(io.BytesIO(img_bytes))
+        extrema = img.convert("L").getextrema()
+        if extrema[1] - extrema[0] < 10:  # ほぼ単色 → 空白と判定
+            blank_count += 1
+    return {
+        "total": len(plots),
+        "blank_count": blank_count,
+    }
+
+
+def create_preview_grid(plots: list[bytes], cols: int = NUM_COLS,
+                        rows: int = NUM_ROWS,
+                        thumb_size: tuple[int, int] = (120, 100)) -> bytes:
+    """プロット画像のグリッドプレビュー (PNG) を生成する."""
+    tw, th = thumb_size
+    pad = 4
+    grid_w = cols * (tw + pad) + pad
+    grid_h = rows * (th + pad) + pad
+    grid = Image.new("RGB", (grid_w, grid_h), "white")
+
+    for i, img_bytes in enumerate(plots):
+        r, c = divmod(i, cols)
+        img = Image.open(io.BytesIO(img_bytes))
+        img.thumbnail(thumb_size)
+        x = pad + c * (tw + pad)
+        y = pad + r * (th + pad)
+        grid.paste(img, (x, y))
+
+    buf = io.BytesIO()
+    grid.save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def validate_excel(xlsx_bytes: bytes) -> list[str]:
+    """Excel ファイルの構造を検証し、警告リストを返す."""
+    warnings = []
+    try:
+        with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as zf:
+            name, _ = _find_plot_sheet(zf)
+            if "Plot" not in name:
+                warnings.append(f"'Plot' シートが見つからず、代わりに '{name}' を使用します。")
+    except Exception as e:
+        warnings.append(f"Excel の構造読み取りに失敗: {e}")
+    return warnings
+
+
 def process(pdf_bytes: bytes, xlsx_bytes: bytes) -> bytes:
     """PDF からプロットを切り出し、Excel に画像を挿入する."""
     plots = extract_plots_from_pdf(pdf_bytes)
