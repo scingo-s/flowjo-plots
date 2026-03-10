@@ -11,8 +11,10 @@ import numpy as np
 from lxml import etree
 from PIL import Image
 
+Image.MAX_IMAGE_PIXELS = 200_000_000  # 高DPI レンダリング用
 
-DPI = 500
+DETECT_DPI = 500   # グリッド検出用
+RENDER_DPI = 1000  # 画像切り出し用（高解像度）
 NUM_COLS = 8  # プロット列数（固定: FSC/SSC, Pop1/2, CAR, CD3/56, etc.）
 
 # Excel Plot シートのセル配置
@@ -32,10 +34,10 @@ NS_MC = "http://schemas.openxmlformats.org/markup-compatibility/2006"
 
 # Rich Data relationship types
 REL_TYPE_METADATA = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/sheetMetadata"
-REL_TYPE_RICHVALUE = "http://schemas.microsoft.com/office/2022/10/relationships/rdRichValue"
+REL_TYPE_RICHVALUE = "http://schemas.microsoft.com/office/2017/06/relationships/rdRichValue"
 REL_TYPE_RICHVALREL = "http://schemas.microsoft.com/office/2022/10/relationships/richValueRel"
-REL_TYPE_RICHVALSTRUCT = "http://schemas.microsoft.com/office/2022/10/relationships/rdRichValueStructure"
-REL_TYPE_RICHVALTYPES = "http://schemas.microsoft.com/office/2022/10/relationships/rdRichValueTypes"
+REL_TYPE_RICHVALSTRUCT = "http://schemas.microsoft.com/office/2017/06/relationships/rdRichValueStructure"
+REL_TYPE_RICHVALTYPES = "http://schemas.microsoft.com/office/2017/06/relationships/rdRichValueTypes"
 REL_TYPE_IMAGE = "http://schemas.openxmlformats.org/officeDocument/2006/relationships/image"
 
 GUID_RICHVALUE = "{3e2802c4-a4d2-4d8b-9148-e3be6c30e623}"
@@ -113,19 +115,30 @@ def extract_plots_from_pdf(pdf_bytes: bytes) -> tuple[list[bytes], int, int]:
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
     page = doc[0]
 
-    scale = DPI / 72
-    mat = fitz.Matrix(scale, scale)
-    pix = page.get_pixmap(matrix=mat)
-    img = Image.open(io.BytesIO(pix.tobytes("png")))
+    # 低DPIでグリッド検出
+    detect_scale = DETECT_DPI / 72
+    det_mat = fitz.Matrix(detect_scale, detect_scale)
+    det_pix = page.get_pixmap(matrix=det_mat)
+    det_img = Image.open(io.BytesIO(det_pix.tobytes("png")))
 
-    row_bands, col_bands = _detect_grid(img)
+    row_bands, col_bands = _detect_grid(det_img)
     num_rows = len(row_bands)
     num_cols = len(col_bands)
+
+    # 高DPIで切り出し（座標をスケール）
+    ratio = RENDER_DPI / DETECT_DPI
+    render_scale = RENDER_DPI / 72
+    ren_mat = fitz.Matrix(render_scale, render_scale)
+    ren_pix = page.get_pixmap(matrix=ren_mat)
+    hi_img = Image.open(io.BytesIO(ren_pix.tobytes("png")))
 
     plots = []
     for row_s, row_e in row_bands:
         for col_s, col_e in col_bands:
-            crop = img.crop((col_s, row_s, col_e, row_e))
+            crop = hi_img.crop((
+                int(col_s * ratio), int(row_s * ratio),
+                int(col_e * ratio), int(row_e * ratio),
+            ))
             buf = io.BytesIO()
             crop.save(buf, format="PNG")
             plots.append(buf.getvalue())
@@ -214,7 +227,8 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
                          Target=f"../media/image{i + 1}.png")
 
     # 3. rdrichvalue.xml
-    rv_data = etree.Element(f"{{{NS_RICHDATA}}}rvData", count=str(n))
+    rv_data = etree.Element(f"{{{NS_RICHDATA}}}rvData", count=str(n),
+                            nsmap={None: NS_RICHDATA})
     for i in range(n):
         rv = etree.SubElement(rv_data, f"{{{NS_RICHDATA}}}rv", s="0")
         v1 = etree.SubElement(rv, f"{{{NS_RICHDATA}}}v")
@@ -223,7 +237,8 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
         v2.text = "5"
 
     # 4. rdrichvaluestructure.xml
-    rv_struct = etree.Element(f"{{{NS_RICHDATA}}}rvStructures", count="1")
+    rv_struct = etree.Element(f"{{{NS_RICHDATA}}}rvStructures", count="1",
+                              nsmap={None: NS_RICHDATA})
     s_el = etree.SubElement(rv_struct, f"{{{NS_RICHDATA}}}s", t="_localImage")
     etree.SubElement(s_el, f"{{{NS_RICHDATA}}}k", n="_rvRel:LocalImageIdentifier", t="i")
     etree.SubElement(s_el, f"{{{NS_RICHDATA}}}k", n="CalcOrigin", t="i")
@@ -296,51 +311,30 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
             if item not in skip:
                 zout.writestr(item, zin.read(item))
 
-        # シート XML を更新 (vm 属性を追加)
-        sheet_xml = zin.read(sheet_path)
-        sheet_root = etree.fromstring(sheet_xml)
-        ns = {"x": NS_SHEET}
-
-        # セル→vm マッピング
-        vm_map = {}
-        for col_letter, excel_row, idx in cells:
-            cell_ref = f"{col_letter}{excel_row}"
-            vm_map[cell_ref] = idx + 1  # 1-indexed
-
-        # 既存の行を走査してセルに vm を付与、なければ作成
-        sheet_data = sheet_root.find(f"{{{NS_SHEET}}}sheetData")
-        existing_rows = {int(r.get("r")): r for r in sheet_data.findall(f"{{{NS_SHEET}}}row")}
+        # シート XML を更新 (vm 属性を追加) - 正規表現で最小限の書き換え
+        sheet_xml = zin.read(sheet_path).decode("utf-8")
 
         for col_letter, excel_row, idx in cells:
             cell_ref = f"{col_letter}{excel_row}"
-            col_num = _col_to_num(col_letter)
+            vm_val = idx + 1
 
-            row_el = existing_rows.get(excel_row)
-            if row_el is None:
-                row_el = etree.SubElement(sheet_data, f"{{{NS_SHEET}}}row", r=str(excel_row))
-                existing_rows[excel_row] = row_el
+            # セルが存在するか確認
+            cell_pat = re.compile(
+                rf'(<c\b[^>]*?\br="{re.escape(cell_ref)}"[^>]*?)(/>|>(.*?)</c>)',
+                re.DOTALL,
+            )
+            m = cell_pat.search(sheet_xml)
+            if m:
+                tag_open = m.group(1)
+                # 既存の t= を除去して vm, t を追加
+                tag_open = re.sub(r'\s+t="[^"]*"', "", tag_open)
+                tag_open = re.sub(r'\s+vm="[^"]*"', "", tag_open)
+                tag_open += f' vm="{vm_val}" t="e"'
+                sheet_xml = (sheet_xml[:m.start()]
+                             + tag_open + '><v>#VALUE!</v></c>'
+                             + sheet_xml[m.end():])
 
-            # セル要素を探す
-            cell_el = None
-            for c in row_el.findall(f"{{{NS_SHEET}}}c"):
-                if c.get("r") == cell_ref:
-                    cell_el = c
-                    break
-
-            if cell_el is None:
-                cell_el = etree.SubElement(row_el, f"{{{NS_SHEET}}}c", r=cell_ref)
-
-            cell_el.set("vm", str(idx + 1))
-            # IMAGE 関数のセルには t="e" (error) と v 要素が必要
-            cell_el.set("t", "e")
-            v_el = cell_el.find(f"{{{NS_SHEET}}}v")
-            if v_el is None:
-                v_el = etree.SubElement(cell_el, f"{{{NS_SHEET}}}v")
-            v_el.text = "#VALUE!"
-
-        zout.writestr(sheet_path,
-                      etree.tostring(sheet_root, xml_declaration=True,
-                                     encoding="UTF-8", standalone=True))
+        zout.writestr(sheet_path, sheet_xml.encode("utf-8"))
 
         # Rich Data ファイルを書き出し
         def _to_xml(root_el):
