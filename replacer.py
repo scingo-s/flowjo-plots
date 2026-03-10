@@ -1,5 +1,7 @@
 """FlowJo PDF からプロット画像を切り出し、Excel に IMAGE 関数として挿入するモジュール."""
 
+from __future__ import annotations
+
 import io
 import re
 import zipfile
