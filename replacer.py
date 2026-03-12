@@ -52,8 +52,35 @@ def _col_to_num(col_letter: str) -> int:
     return _COL_MAP[col_letter]
 
 
+def _find_zero_gaps(proj: np.ndarray, min_width: int = 15) -> list[tuple[int, int, int]]:
+    """投影配列からゼロコンテンツのギャップを検出する.
+
+    Returns:
+        (start, end, width) のリスト.
+    """
+    in_gap = proj == 0
+    gaps = []
+    gap_start = None
+    for i in range(len(proj)):
+        if in_gap[i] and gap_start is None:
+            gap_start = i
+        elif not in_gap[i] and gap_start is not None:
+            width = i - gap_start
+            if width >= min_width:
+                gaps.append((gap_start, i, width))
+            gap_start = None
+    if gap_start is not None:
+        width = len(proj) - gap_start
+        if width >= min_width:
+            gaps.append((gap_start, len(proj), width))
+    return gaps
+
+
 def _detect_grid(img: Image.Image) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
     """画像からプロットグリッドの行・列バンドを自動検出する.
+
+    ゼロコンテンツギャップ方式: コンテンツストリップ内の完全白列/行ギャップ(>=15px)
+    を検出し、左右マージンとテキストラベル領域を除外して8プロット列を特定する.
 
     Returns:
         (row_bands, col_bands) - 各バンドは (start, end) のピクセル座標タプル.
@@ -63,71 +90,79 @@ def _detect_grid(img: Image.Image) -> tuple[list[tuple[int, int]], list[tuple[in
     h, w = arr.shape
     content = arr < 240  # non-white pixels
 
-    # 行バンド検出: 各行の非白ピクセル数
+    # コンテンツ行範囲を検出
     row_proj = content.sum(axis=1)
-    row_threshold = w * 0.02
-    content_rows = np.where(row_proj > row_threshold)[0]
+    row_active = np.where(row_proj > w * 0.01)[0]
+    if len(row_active) == 0:
+        return [], []
+    r1, r2 = int(row_active[0]), int(row_active[-1])
 
+    col_active = np.where(content.sum(axis=0) > h * 0.01)[0]
+    if len(col_active) == 0:
+        return [], []
+    c1, c2 = int(col_active[0]), int(col_active[-1])
+
+    # --- 列バンド検出 ---
+    # コンテンツ行ストリップ内の列投影でゼロギャップを検出
+    strip = content[r1:r2 + 1, :]
+    col_proj = strip.sum(axis=0)
+    col_gaps = _find_zero_gaps(col_proj, min_width=15)
+
+    # 左右マージン（画像端に接するギャップ）を除外
+    internal_col_gaps = [(s, e, gw) for s, e, gw in col_gaps if s > 0 and e < w]
+
+    # 最大の内部ギャップ（テキストラベル-プロット間）を除外、残りがプロット区切り
+    col_dividers = []
+    if len(internal_col_gaps) > 1:
+        sorted_by_width = sorted(internal_col_gaps, key=lambda x: x[2], reverse=True)
+        text_gap = sorted_by_width[0]
+        col_dividers = sorted(sorted_by_width[1:], key=lambda x: x[0])
+        # プロット列領域を定義
+        first_plot_start = text_gap[1]  # テキストギャップの右端
+        col_bands = []
+        prev_start = first_plot_start
+        for gs, ge, _ in col_dividers:
+            col_bands.append((prev_start, gs))
+            prev_start = ge
+        col_bands.append((prev_start, c2))
+    elif len(internal_col_gaps) == 1:
+        # テキストギャップのみ → プロット領域は1つ
+        col_bands = [(internal_col_gaps[0][1], c2)]
+    else:
+        col_bands = [(c1, c2)]
+
+    # --- 行バンド検出 ---
+    # プロット列範囲内の行投影でゼロギャップを検出
+    plot_left = col_bands[0][0] if col_bands else c1
+    plot_right = col_bands[-1][1] if col_bands else c2
+    col_strip = content[:, plot_left:plot_right + 1]
+    row_proj2 = col_strip.sum(axis=1)
+    row_gaps = _find_zero_gaps(row_proj2, min_width=15)
+
+    # マージンギャップ（コンテンツ外）を除外
+    internal_row_gaps = [(s, e, gw) for s, e, gw in row_gaps
+                         if s > r1 and e < r2]
+
+    # 行領域を構築
+    row_dividers = sorted(internal_row_gaps, key=lambda x: x[0])
     row_bands = []
-    if len(content_rows) > 0:
-        start = int(content_rows[0])
-        prev = start
-        for r in content_rows[1:]:
-            if r - prev > 15:
-                row_bands.append((start, int(prev)))
-                start = int(r)
-            prev = int(r)
-        row_bands.append((start, int(prev)))
-
-    # 列バンド検出: 各列の非白ピクセル数
-    col_proj = content.sum(axis=0)
-    col_threshold = h * 0.02
-    content_cols = np.where(col_proj > col_threshold)[0]
-
-    col_bands_all = []
-    if len(content_cols) > 0:
-        start = int(content_cols[0])
-        prev = start
-        for c in content_cols[1:]:
-            if c - prev > 15:
-                col_bands_all.append((start, int(prev)))
-                start = int(c)
-            prev = int(c)
-        col_bands_all.append((start, int(prev)))
-
-    # 狭いバンド（軸ラベル等）を除外: 最大幅の50%未満のバンドを除去
-    col_bands = col_bands_all
-    if len(col_bands_all) > 2:
-        widths = [e - s for s, e in col_bands_all]
-        max_width = max(widths)
-        col_bands = [(s, e) for s, e in col_bands_all
-                     if (e - s) >= max_width * 0.5]
+    prev_start = r1
+    for gs, ge, _ in row_dividers:
+        row_bands.append((prev_start, gs))
+        prev_start = ge
+    row_bands.append((prev_start, r2))
 
     return row_bands, col_bands
 
 
-def extract_plots_from_pdf(pdf_bytes: bytes) -> tuple[list[bytes], int, int]:
-    """PDF からプロット画像を自動検出・切り出す.
-
-    Returns:
-        (plots, num_rows, num_cols) - 画像バイトのリスト、検出された行数・列数.
-    """
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    page = doc[0]
-
-    # 低DPIでグリッド検出
-    detect_scale = DETECT_DPI / 72
+def _extract_page_plots(page, detect_scale, render_scale, ratio):
+    """1ページからプロット画像を切り出す."""
     det_mat = fitz.Matrix(detect_scale, detect_scale)
     det_pix = page.get_pixmap(matrix=det_mat)
     det_img = Image.open(io.BytesIO(det_pix.tobytes("png")))
 
     row_bands, col_bands = _detect_grid(det_img)
-    num_rows = len(row_bands)
-    num_cols = len(col_bands)
 
-    # 高DPIで切り出し（座標をスケール）
-    ratio = RENDER_DPI / DETECT_DPI
-    render_scale = RENDER_DPI / 72
     ren_mat = fitz.Matrix(render_scale, render_scale)
     ren_pix = page.get_pixmap(matrix=ren_mat)
     hi_img = Image.open(io.BytesIO(ren_pix.tobytes("png")))
@@ -142,6 +177,39 @@ def extract_plots_from_pdf(pdf_bytes: bytes) -> tuple[list[bytes], int, int]:
             buf = io.BytesIO()
             crop.save(buf, format="PNG")
             plots.append(buf.getvalue())
+
+    return plots, len(row_bands), len(col_bands)
+
+
+def extract_plots_from_pdf(pdf_bytes: bytes) -> tuple[list[bytes], int, int]:
+    """PDF からプロット画像を自動検出・切り出す.
+
+    1ページPDF: フルグリッド検出 (行×列).
+    マルチページPDF: 各ページを1サンプル (1行×N列) として処理し結合.
+
+    Returns:
+        (plots, num_rows, num_cols) - 画像バイトのリスト、検出された行数・列数.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    detect_scale = DETECT_DPI / 72
+    render_scale = RENDER_DPI / 72
+    ratio = RENDER_DPI / DETECT_DPI
+
+    if doc.page_count == 1:
+        plots, num_rows, num_cols = _extract_page_plots(
+            doc[0], detect_scale, render_scale, ratio)
+    else:
+        # マルチページ: 各ページ = 1サンプル (1行)
+        all_plots = []
+        num_cols = 0
+        for page_idx in range(doc.page_count):
+            page_plots, _, page_cols = _extract_page_plots(
+                doc[page_idx], detect_scale, render_scale, ratio)
+            all_plots.extend(page_plots)
+            if page_cols > num_cols:
+                num_cols = page_cols
+        plots = all_plots
+        num_rows = doc.page_count
 
     doc.close()
     return plots, num_rows, num_cols
@@ -374,11 +442,11 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
 
 
 def validate_pdf(pdf_bytes: bytes) -> list[str]:
-    """PDF の基本的な検証を行い、警告リストを返す."""
+    """PDF の基本的な検証を行い、情報/警告リストを返す."""
     warnings = []
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    if doc.page_count != 1:
-        warnings.append(f"PDF が {doc.page_count} ページあります（期待値: 1ページ）。先頭ページのみ処理します。")
+    if doc.page_count > 1:
+        warnings.append(f"info:{doc.page_count} ページ検出 → {doc.page_count} サンプルとして処理します。")
     doc.close()
     return warnings
 

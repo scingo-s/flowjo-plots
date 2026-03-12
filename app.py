@@ -95,9 +95,12 @@ def show_upload_step():
 
 def show_preview_step():
     """Step 2: プレビュー確認 + Excel 挿入."""
-    # 警告表示
+    # 警告・情報表示
     for w in st.session_state.get("pdf_warnings", []):
-        st.warning(w)
+        if w.startswith("info:"):
+            st.info(w[5:])
+        else:
+            st.warning(w)
     for w in st.session_state.get("xlsx_warnings", []):
         st.warning(w)
 
