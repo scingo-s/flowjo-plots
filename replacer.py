@@ -255,6 +255,22 @@ def _find_plot_sheet(zf: zipfile.ZipFile) -> tuple[str, str]:
     raise ValueError("Plot sheet not found")
 
 
+def _find_display_plot_sheet(zf: zipfile.ZipFile) -> str | None:
+    """表示用 Plot シート (INDEX 数式で貼り付け用を参照) の XML パスを返す."""
+    ns = {"x": NS_SHEET, "r": NS_REL}
+    wb_root = etree.fromstring(zf.read("xl/workbook.xml"))
+    rels_root = etree.fromstring(zf.read("xl/_rels/workbook.xml.rels"))
+
+    for s in wb_root.findall(".//x:sheet", ns):
+        name = s.get("name")
+        if "Plot" in name and "報告" not in name and "貼り付け用" not in name:
+            rid = s.get(f"{{{NS_REL}}}id")
+            for rel in rels_root:
+                if rel.get("Id") == rid:
+                    return "xl/" + rel.get("Target")
+    return None
+
+
 def _build_metadata_xml(zin: zipfile.ZipFile, n: int) -> str:
     """既存の metadata.xml に XLRICHVALUE エントリをマージして返す.
 
@@ -381,11 +397,13 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
                         f'Target="../media/image{i + 1}.png"/>')
     rv_rels_xml += '</Relationships>'
 
-    # 3. rdrichvalue.xml
+    # 3. rdrichvalue.xml — CalcOrigin=5 (直接挿入) + CalcOrigin=4 (数式参照) の両方
     rv_data_xml = _XML_DECL
-    rv_data_xml += f'<rvData xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="{n}">'
+    rv_data_xml += f'<rvData xmlns="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" count="{n * 2}">'
     for i in range(n):
         rv_data_xml += f'<rv s="0"><v>{i}</v><v>5</v></rv>'
+    for i in range(n):
+        rv_data_xml += f'<rv s="0"><v>{i}</v><v>4</v></rv>'
     rv_data_xml += '</rvData>'
 
     # 4. rdrichvaluestructure.xml
@@ -411,7 +429,7 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
     rv_types_xml += '</keyFlags></global></rvTypesInfo>'
 
     # 6. metadata.xml — 既存のメタデータ (XLDAPR 等) を保持しつつ XLRICHVALUE を追加
-    # metadata_xml は後で既存ファイルを読んでからマージするため、ここでは None
+    # n*2 エントリ: n 個が CalcOrigin=5 (直接), n 個が CalcOrigin=4 (INDEX 数式参照)
     meta_xml = None  # build_metadata_xml() で生成
 
     # --- xlsx ZIP を書き換え ---
@@ -435,6 +453,11 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
         _, sheet_path = _find_plot_sheet(zin)
         skip.add(sheet_path)
 
+        # 表示用 Plot シートも上書き対象
+        display_plot_path = _find_display_plot_sheet(zin)
+        if display_plot_path:
+            skip.add(display_plot_path)
+
         # 既存 media ファイルも除外 (上書き)
         existing_media = {name for name in zin.namelist() if name.startswith("xl/media/")}
         skip.update(existing_media)
@@ -443,10 +466,10 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
             if item not in skip:
                 zout.writestr(item, zin.read(item))
 
-        # metadata.xml: 既存を読み込み XLRICHVALUE をマージ
-        meta_xml = _build_metadata_xml(zin, n)
+        # metadata.xml: 既存を読み込み XLRICHVALUE をマージ (n*2: 直接+INDEX参照)
+        meta_xml = _build_metadata_xml(zin, n * 2)
 
-        # シート XML を更新 (vm 属性を追加) - 正規表現で最小限の書き換え
+        # --- Plot (貼り付け用) シート XML を更新 (vm 属性を追加) ---
         sheet_xml = zin.read(sheet_path).decode("utf-8")
 
         for col_letter, excel_row, idx in cells:
@@ -470,6 +493,57 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
                              + sheet_xml[m.end():])
 
         zout.writestr(sheet_path, sheet_xml.encode("utf-8"))
+
+        # --- Plot シートの INDEX 数式セルを vm 属性で置換 ---
+        paste_sheet_name, _ = _find_plot_sheet(zin)
+        if display_plot_path:
+            plot_xml = zin.read(display_plot_path).decode("utf-8")
+            # "Plot (貼り付け用)" を参照する INDEX 数式セルを検出
+            idx_pat = re.compile(
+                r"INDEX\(\s*'" + re.escape(paste_sheet_name) + r"'!([A-Z]+):",
+            )
+            # 貼り付け用シートの列→画像列インデックスのマップ
+            paste_col_map = {col: i for i, col in enumerate(EXCEL_COLS)}
+
+            cell_pat = re.compile(
+                r'(<c\b[^>]*?\br="([A-Z]+\d+)"[^>]*?(?<!/)>)(.*?)</c>',
+                re.DOTALL,
+            )
+            replacements = []
+            for m in cell_pat.finditer(plot_xml):
+                tag_open, cell_ref, content = m.group(1), m.group(2), m.group(3)
+                f_match = re.search(r'<f[^>]*>([^<]+)</f>', content)
+                if not f_match:
+                    continue
+                formula = f_match.group(1)
+                col_match = idx_pat.search(formula)
+                if not col_match:
+                    continue
+                src_col = col_match.group(1)  # 参照先列 (F, G, H, ...)
+                col_idx = paste_col_map.get(src_col)
+                if col_idx is None:
+                    continue
+                # 行番号からサンプルインデックスを計算
+                row_num = int(re.search(r'\d+', cell_ref).group())
+                sample_idx = (row_num - 1) // 5  # 5行ステップ、0-indexed
+                # 対応する画像インデックス
+                img_idx = sample_idx * num_cols + col_idx
+                if img_idx >= n:
+                    continue
+                # vm 値: n + img_idx + 1 (CalcOrigin=4 エントリ、1-based)
+                vm_val = n + img_idx + 1
+                replacements.append((m.start(), m.end(), tag_open, vm_val))
+
+            # 後ろから置換（位置ずれ防止）
+            for start, end, tag_open, vm_val in reversed(replacements):
+                new_tag = re.sub(r'\s+t="[^"]*"', "", tag_open)
+                new_tag = re.sub(r'\s+vm="[^"]*"', "", new_tag)
+                new_tag = re.sub(r'\s+cm="[^"]*"', "", new_tag)
+                new_tag = new_tag.rstrip(">")  # 閉じ > を除去してから属性追加
+                new_tag += f' vm="{vm_val}" t="e"'
+                plot_xml = plot_xml[:start] + new_tag + '><v>#VALUE!</v></c>' + plot_xml[end:]
+
+            zout.writestr(display_plot_path, plot_xml.encode("utf-8"))
 
         # Rich Data ファイルを書き出し
         zout.writestr("xl/richData/richValueRel.xml", rv_rel_xml.encode("utf-8"))
