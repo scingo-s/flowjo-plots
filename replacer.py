@@ -17,10 +17,10 @@ DETECT_DPI = 500   # グリッド検出用
 RENDER_DPI = 1000  # 画像切り出し用（高解像度）
 NUM_COLS = 8  # プロット列数（固定: FSC/SSC, Pop1/2, CAR, CD3/56, etc.）
 
-# Excel Plot シートのセル配置
-EXCEL_COLS = ["E", "F", "H", "J", "L", "M", "N", "O"]
-EXCEL_ROW_START = 5
-EXCEL_ROW_STEP = 5
+# Excel "Plot (貼り付け用)" シートのセル配置
+EXCEL_COLS = ["F", "G", "H", "I", "J", "K", "L", "M"]
+EXCEL_ROW_START = 3
+EXCEL_ROW_STEP = 1
 
 # 名前空間
 NS_SHEET = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
@@ -227,10 +227,19 @@ def _find_plot_sheet(zf: zipfile.ZipFile) -> tuple[str, str]:
     target_rid = None
     for s in wb_root.findall(".//x:sheet", ns):
         name = s.get("name")
-        if "Plot" in name and "報告" not in name:
+        if "貼り付け用" in name:
             target_name = name
             target_rid = s.get(f"{{{NS_REL}}}id")
             break
+
+    # フォールバック: "Plot" を含むシート (報告用以外)
+    if target_rid is None:
+        for s in wb_root.findall(".//x:sheet", ns):
+            name = s.get("name")
+            if "Plot" in name and "報告" not in name and "貼り付け用" not in name:
+                target_name = name
+                target_rid = s.get(f"{{{NS_REL}}}id")
+                break
 
     if target_rid is None:
         # fallback to first sheet
@@ -496,7 +505,11 @@ def validate_excel(xlsx_bytes: bytes) -> list[str]:
     try:
         with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as zf:
             name, _ = _find_plot_sheet(zf)
-            if "Plot" not in name:
+            if "貼り付け用" in name:
+                pass  # 理想的なシート
+            elif "Plot" in name:
+                warnings.append(f"'Plot (貼り付け用)' シートが見つからず、'{name}' に挿入します。")
+            else:
                 warnings.append(f"'Plot' シートが見つからず、代わりに '{name}' を使用します。")
     except Exception as e:
         warnings.append(f"Excel の構造読み取りに失敗: {e}")
