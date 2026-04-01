@@ -255,6 +255,92 @@ def _find_plot_sheet(zf: zipfile.ZipFile) -> tuple[str, str]:
     raise ValueError("Plot sheet not found")
 
 
+def _build_metadata_xml(zin: zipfile.ZipFile, n: int) -> str:
+    """既存の metadata.xml に XLRICHVALUE エントリをマージして返す.
+
+    テンプレートに XLDAPR (動的配列) 等の既存メタデータがある場合、
+    それを保持しつつ XLRICHVALUE を先頭に追加する。
+    """
+    _XML_DECL = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>\n'
+    XLRV_TYPE = ('<metadataType name="XLRICHVALUE" minSupportedVersion="120000" '
+                 'copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" '
+                 'rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1"/>')
+
+    # 既存の metadata.xml を読み込み
+    existing_meta = None
+    if "xl/metadata.xml" in zin.namelist():
+        existing_meta = zin.read("xl/metadata.xml").decode("utf-8")
+
+    # XLRICHVALUE の futureMetadata + valueMetadata
+    rv_future = f'<futureMetadata name="XLRICHVALUE" count="{n}">'
+    for i in range(n):
+        rv_future += f'<bk><extLst><ext uri="{GUID_RICHVALUE}"><xlrd:rvb i="{i}"/></ext></extLst></bk>'
+    rv_future += '</futureMetadata>'
+
+    rv_value = f'<valueMetadata count="{n}">'
+    for i in range(n):
+        rv_value += f'<bk><rc t="1" v="{i}"/></bk>'
+    rv_value += '</valueMetadata>'
+
+    if existing_meta and "XLDAPR" in existing_meta:
+        # 既存の XLDAPR を保持しつつマージ
+        # metadataTypes: XLRICHVALUE(type=1) + XLDAPR(type=2)
+        old_type_count = len(re.findall(r"<metadataType\b", existing_meta))
+        new_type_count = old_type_count + 1
+
+        # metadataTypes の count を更新し、XLRICHVALUE を先頭に挿入
+        meta_xml = re.sub(
+            r'<metadataTypes\s+count="\d+">\s*',
+            f'<metadataTypes count="{new_type_count}">{XLRV_TYPE}',
+            existing_meta,
+        )
+
+        # 既存の cellMetadata の rc 要素の t 値をインクリメント (XLRICHVALUE が type=1 に入るため)
+        def _inc_rc_t(m):
+            old_t = int(m.group(1))
+            return f'<rc t="{old_t + 1}"'
+        meta_xml = re.sub(
+            r'(<cellMetadata\b.*?</cellMetadata>)',
+            lambda m: re.sub(r'<rc t="(\d+)"', _inc_rc_t, m.group(0)),
+            meta_xml,
+            flags=re.DOTALL,
+        )
+
+        # XLRICHVALUE の futureMetadata を既存の futureMetadata の前に挿入
+        meta_xml = re.sub(
+            r'(<futureMetadata\b)',
+            rv_future + r'\1',
+            meta_xml,
+            count=1,
+        )
+
+        # valueMetadata を cellMetadata の後に挿入 (OOXML スキーマ順: cellMetadata → valueMetadata)
+        meta_xml = re.sub(
+            r'(</cellMetadata>)',
+            r'\1' + rv_value,
+            meta_xml,
+            count=1,
+        )
+
+        # xlrd 名前空間が宣言されているか確認
+        if 'xmlns:xlrd=' not in meta_xml:
+            meta_xml = meta_xml.replace(
+                '<metadata ',
+                '<metadata xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata" ',
+                1,
+            )
+    else:
+        # 既存メタデータなし → XLRICHVALUE のみで新規作成
+        meta_xml = _XML_DECL
+        meta_xml += ('<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"'
+                     ' xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata">')
+        meta_xml += f'<metadataTypes count="1">{XLRV_TYPE}</metadataTypes>'
+        meta_xml += rv_future
+        meta_xml += rv_value
+        meta_xml += '</metadata>'
+
+    return meta_xml
+
 
 def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
                           num_rows: int = 0, num_cols: int = NUM_COLS) -> bytes:
@@ -324,21 +410,9 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
             rv_types_xml += f'<key name="{kname}"><flag name="ExcludeFromCalcComparison" value="1"/></key>'
     rv_types_xml += '</keyFlags></global></rvTypesInfo>'
 
-    # 6. metadata.xml
-    meta_xml = _XML_DECL
-    meta_xml += '<metadata xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:xlrd="http://schemas.microsoft.com/office/spreadsheetml/2017/richdata">'
-    meta_xml += '<metadataTypes count="1">'
-    meta_xml += '<metadataType name="XLRICHVALUE" minSupportedVersion="120000" copy="1" pasteAll="1" pasteValues="1" merge="1" splitFirst="1" rowColShift="1" clearFormats="1" clearComments="1" assign="1" coerce="1"/>'
-    meta_xml += '</metadataTypes>'
-    meta_xml += f'<futureMetadata name="XLRICHVALUE" count="{n}">'
-    for i in range(n):
-        meta_xml += f'<bk><extLst><ext uri="{GUID_RICHVALUE}"><xlrd:rvb i="{i}"/></ext></extLst></bk>'
-    meta_xml += '</futureMetadata>'
-    meta_xml += f'<valueMetadata count="{n}">'
-    for i in range(n):
-        meta_xml += f'<bk><rc t="1" v="{i}"/></bk>'
-    meta_xml += '</valueMetadata>'
-    meta_xml += '</metadata>'
+    # 6. metadata.xml — 既存のメタデータ (XLDAPR 等) を保持しつつ XLRICHVALUE を追加
+    # metadata_xml は後で既存ファイルを読んでからマージするため、ここでは None
+    meta_xml = None  # build_metadata_xml() で生成
 
     # --- xlsx ZIP を書き換え ---
     output = io.BytesIO()
@@ -355,6 +429,7 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
             "xl/richData/rdrichvalue.xml",
             "xl/richData/rdrichvaluestructure.xml",
             "xl/richData/rdRichValueTypes.xml",
+            "xl/calcChain.xml",  # Rich Data 追加で整合性が崩れるため除外（Excel が自動再生成）
         }
 
         _, sheet_path = _find_plot_sheet(zin)
@@ -367,6 +442,9 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
         for item in zin.namelist():
             if item not in skip:
                 zout.writestr(item, zin.read(item))
+
+        # metadata.xml: 既存を読み込み XLRICHVALUE をマージ
+        meta_xml = _build_metadata_xml(zin, n)
 
         # シート XML を更新 (vm 属性を追加) - 正規表現で最小限の書き換え
         sheet_xml = zin.read(sheet_path).decode("utf-8")
@@ -426,10 +504,16 @@ def insert_images_to_xlsx(xlsx_bytes: bytes, plot_images: list[bytes],
             if part not in ct_xml:
                 ct_xml = ct_xml.replace("</Types>",
                     f'<Override PartName="{part}" ContentType="{ctype}"/></Types>')
+        # calcChain を除外したので Content_Types からも削除
+        ct_xml = re.sub(
+            r'<Override[^>]*PartName="/xl/calcChain\.xml"[^>]*/>', "", ct_xml)
         zout.writestr("[Content_Types].xml", ct_xml.encode("utf-8"))
 
         # workbook.xml.rels を更新 (文字列操作)
         wb_rels_xml = zin.read("xl/_rels/workbook.xml.rels").decode("utf-8")
+        # calcChain 参照を除去
+        wb_rels_xml = re.sub(
+            r'<Relationship[^>]*Target="calcChain\.xml"[^>]*/>', "", wb_rels_xml)
         rids = [int(m) for m in re.findall(r'Id="rId(\d+)"', wb_rels_xml)]
         max_rid = max(rids) if rids else 0
 
