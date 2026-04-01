@@ -164,7 +164,7 @@ def show_done_step():
 
 def main():
     st.title("FlowJo Plot 画像差替ツール")
-    st.caption("FlowJo バッチ出力 PDF のプロット画像を Excel に自動貼付します")
+    st.caption("FlowJo バッチ出力 PDF のプロット画像を Excel に自動貼付します (v2.1)")
 
     if not check_password():
         return
